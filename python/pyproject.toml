@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "factlet"
+version = "0.1.0"
+description = "Reference Python implementation of the Factlet Protocol v0.1"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Factlet Protocol contributors" }
+]
+keywords = ["ai", "llm", "grounding", "factbook", "factlet-protocol"]
+dependencies = [
+  "pyyaml>=6.0"
+]
+
+[project.urls]
+Homepage = "https://factlet.ai"
+Repository = "https://github.com/factlet-ai/reference-sdk"
+Specification = "https://github.com/factlet-ai/spec"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["factlet"]

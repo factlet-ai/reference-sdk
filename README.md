@@ -1,38 +1,51 @@
 # Factlet Protocol — reference SDK
 
-Minimal Python and TypeScript reference implementations of the [Factlet Protocol](https://factlet.ai). Other implementations test against these.
+Reference implementations of the [Factlet Protocol v0.1](https://github.com/factlet-ai/spec/blob/main/SPEC.md). Other implementations validate against these.
 
 ## Status
 
-**Pre-v0.1 implementation in progress.** APIs unstable. Pin to a specific commit for any consumption until v0.1.0 ships.
+| Implementation | Status | Tests | Path |
+|---|---|---|---|
+| **Python** | ✅ Working v0.1.0 | 13 passing | [`python/`](python/) |
+| **TypeScript** | ⚠️ Planned for v0.1.1 (not yet implemented) | — | [`typescript/`](typescript/) |
 
-## Layout
+Python ships first to lock the contract via tests; TypeScript ports byte-identical behavior next. We chose this over simultaneous development to avoid diverging implementations during the protocol's pre-v1.0 phase.
 
+## Quick start (Python)
+
+```bash
+cd python/
+pip install -e .
+python -c "from factlet import load_factbook, factsignal; \
+  fb = load_factbook('../../registry/examples/payments/factbook.yaml'); \
+  print(factsignal('how do refunds work?', fb))"
 ```
-python/        # Reference Python implementation
-typescript/    # Reference TypeScript implementation
-tests/         # Cross-language test fixtures (shared)
-examples/      # Runnable usage examples
-```
 
-## What this SDK does
+## Public API
 
-The reference SDK implements the five protocol primitives (factlet / FactMap / Factbook / FactSignal / low-FactSignal warning) in the smallest, most dependency-light way possible. It is not optimized for production use — it is the canonical example against which other implementations validate.
+The five protocol primitives, exposed as callable functions:
 
-For production use, see [Kernora's Nora](https://kernora.ai), which is a production-grade implementation of the protocol.
+- `load_factbook(path)` → `Factbook` — parses YAML/JSON Factbook from disk
+- `retrieve(query, factbook)` → `list[Factlet]` — relevance-ordered factlets (§4)
+- `factsignal(query, factbook)` → `int` — coverage bars 0-5 (§6)
+- `on_low_factsignal(query, factbook, threshold, callback)` → `(score, retrieved)` — runtime warning hook (§7)
+- `render_for_claude(factlets)` / `render_for_gpt(factlets)` → `str` — vendor-flavored rendering (§8)
 
-## Develop
+See [python/README.md](python/README.md) for full usage and [python/tests/test_basic.py](python/tests/test_basic.py) for behavior under each scenario.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+## Algorithm contracts vs choices
+
+Per [SPEC.md §4](https://github.com/factlet-ai/spec/blob/main/SPEC.md#4-factmap) and [§6](https://github.com/factlet-ai/spec/blob/main/SPEC.md#6-factsignal), implementations choose their own retrieval and scoring algorithms. The reference SDK uses:
+
+- **Retrieval**: token-overlap weighted by confidence. Simple, fast, deterministic.
+- **FactSignal**: maps (retrieved factlet count) × (top-result confidence) to bars 0-5.
+
+Production implementations (e.g. [Kernora's Nora](https://kernora.ai)) layer embedding-based retrieval and LLM-based scoring on top of the same protocol contract.
+
+## Contribute
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Behavioral changes require corresponding test additions; spec divergence is a bug.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Code of Conduct
-
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-
-## Security
-
-Vulnerability disclosure: see [SECURITY.md](SECURITY.md).
