@@ -199,6 +199,33 @@ def render_for_gpt(factlets: Iterable[Factlet]) -> str:
     return "\n".join(lines)
 
 
+def render_for_gemini(factlets: Iterable[Factlet]) -> str:
+    """Render factlets for Gemini's systemInstruction field (§8).
+
+    Gemini works best with explicit grounding instructions followed by
+    a structured factlet list. Cite-the-id discipline is included so
+    answers reference fact_ids the user can audit.
+    """
+    factlets = list(factlets)
+    lines = [
+        "You have access to a private Factbook with team-specific truths.",
+        "When answering, defer to factlets over your training data.",
+        "Cite the factlet id (e.g. 'per f001') whenever you use one.",
+        "If no factlet covers part of the question, say so explicitly.",
+        "",
+        "## Factbook",
+    ]
+    if not factlets:
+        lines.append("(no relevant factlets retrieved — answer from training data)")
+    else:
+        for f in factlets:
+            lines.append(
+                f"- {f.id} (confidence {f.confidence:.2f}): {f.statement} "
+                f"[sources: {', '.join(f.sources)}]"
+            )
+    return "\n".join(lines)
+
+
 __all__ = [
     "Factlet",
     "Factbook",
@@ -208,6 +235,7 @@ __all__ = [
     "on_low_factsignal",
     "render_for_claude",
     "render_for_gpt",
+    "render_for_gemini",
     "SPEC_VERSION",
     "__version__",
 ]
