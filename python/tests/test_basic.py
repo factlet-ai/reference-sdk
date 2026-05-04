@@ -17,6 +17,7 @@ from factlet import (
     load_factbook,
     on_low_factsignal,
     render_for_claude,
+    render_for_gemini,
     render_for_gpt,
     retrieve,
 )
@@ -147,6 +148,19 @@ def test_render_for_gpt_uses_markdown(factbook):
     assert out.startswith("## Factbook")
     assert "**f001**" in out
     assert "0.95" in out
+
+
+def test_render_for_gemini_includes_grounding_instructions(factbook):
+    out = render_for_gemini(factbook.content[:2])
+    assert "defer to factlets" in out
+    assert "f001" in out
+    assert "f002" in out
+    assert "Cite the factlet id" in out
+
+
+def test_render_for_gemini_handles_empty_factlet_list():
+    out = render_for_gemini([])
+    assert "no relevant factlets" in out
 
 
 def test_dataclass_construction():
