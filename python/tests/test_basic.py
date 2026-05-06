@@ -173,3 +173,93 @@ def test_dataclass_construction():
     )
     fb = Factbook(schema_version="v1.0", content=[f])
     assert factsignal("test", fb) >= 1
+
+
+# ─── RFC-001 / v0.2 strict-scoping validation ────────────────────────────────
+
+VALID_SCOPED_YAML = """
+schema_version: v1.0
+scope: project:factlet-ai
+content:
+  - id: f001
+    statement: "Internal fact A."
+    confidence: 1.0
+    sources: ["doc:1"]
+    supersedes: []
+  - id: f002
+    statement: "Internal fact B referencing internal A."
+    confidence: 1.0
+    sources: ["doc:2"]
+    supersedes: [f001]
+  - id: f003
+    statement: "Fact referencing an external scope."
+    confidence: 1.0
+    sources: ["doc:3"]
+    supersedes: ["kernora:f042"]
+"""
+
+DANGLING_BARE_REF_YAML = """
+schema_version: v1.0
+scope: project:factlet-ai
+content:
+  - id: f001
+    statement: "Has a bare ref that doesn't resolve."
+    confidence: 1.0
+    sources: ["doc:1"]
+    supersedes: [f999]
+"""
+
+NO_SCOPE_YAML = """
+schema_version: v1.0
+content:
+  - id: f001
+    statement: "Factbook missing top-level scope: field."
+    confidence: 1.0
+    sources: ["doc:1"]
+"""
+
+
+def _write_tmp_yaml(content: str) -> str:
+    from factlet import validate, load_factbook
+    p = Path(tempfile.mktemp(suffix=".yaml"))
+    p.write_text(content)
+    return str(p)
+
+
+def test_validate_default_lenient_passes_v01_factbook(factbook):
+    from factlet import validate
+    assert validate(factbook) == []
+
+
+def test_validate_strict_scoping_passes_when_internal_and_scoped_external():
+    from factlet import validate, load_factbook
+    fb = load_factbook(_write_tmp_yaml(VALID_SCOPED_YAML))
+    errs = validate(fb, strict_scoping=True)
+    assert errs == [], errs
+
+
+def test_validate_strict_scoping_flags_dangling_bare_ref():
+    from factlet import validate, load_factbook
+    fb = load_factbook(_write_tmp_yaml(DANGLING_BARE_REF_YAML))
+    errs = validate(fb, strict_scoping=True)
+    assert any("f999" in e and "RFC-001" in e for e in errs), errs
+
+
+def test_validate_strict_scoping_flags_missing_top_level_scope():
+    from factlet import validate, load_factbook
+    fb = load_factbook(_write_tmp_yaml(NO_SCOPE_YAML))
+    errs = validate(fb, strict_scoping=True)
+    assert any("scope:" in e and "RFC-001" in e for e in errs), errs
+
+
+def test_validate_detects_duplicate_ids():
+    from factlet import Factbook, Factlet, validate
+    fb = Factbook(
+        schema_version="v1.0",
+        content=[
+            Factlet(id="f001", statement="A", confidence=1.0, sources=["x"]),
+            Factlet(id="f001", statement="B", confidence=1.0, sources=["y"]),
+        ],
+    )
+    errs = validate(fb)
+    assert any("duplicate id" in e and "f001" in e for e in errs), errs

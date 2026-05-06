@@ -226,6 +226,103 @@ def render_for_gemini(factlets: Iterable[Factlet]) -> str:
     return "\n".join(lines)
 
 
+_SCOPED_REF_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-zA-Z0-9_-]+$")
+_BARE_REF_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
+    """Validate a parsed Factbook against the v0.1 spec.
+
+    Returns a list of error messages. Empty list means valid.
+
+    Per RFC-001 (factlet-ai/spec rfcs/0001-scoped-fact-ids.md, targeting v0.2):
+    when ``strict_scoping=True``, references to other factlets in
+    ``supersedes``, ``merged_into``, and reference-shaped fields MUST use the
+    scoped form ``<scope>:<id>`` (e.g. ``factlet-ai:f001``) when pointing to
+    facts outside this Factbook. Bare IDs (``f001``) are valid only for
+    references to facts inside this same Factbook.
+
+    The file-level ``scope:`` field (when present in the raw YAML, captured
+    in ``Factbook.metadata['scope']``) is treated as the implicit prefix for
+    all bare IDs declared in this file. Internal cross-references using the
+    bare form are allowed; external references (different scope) MUST be
+    scoped.
+
+    Conformance: this is a v0.1-permissive default (``strict_scoping=False``).
+    Setting the flag opts in to v0.2 RFC-001 conformance and MAY emit errors
+    that the v0.1 spec does not flag.
+    """
+    errors: list[str] = []
+
+    # 1. ID uniqueness within file (v0.1 §3.1)
+    seen_ids: set[str] = set()
+    for fact in factbook.content:
+        if fact.id in seen_ids:
+            errors.append(f"duplicate id '{fact.id}' (SPEC §3.1: id MUST be unique within a Factbook)")
+        seen_ids.add(fact.id)
+
+    # 2. Required fields already enforced at parse time by load_factbook;
+    #    validate() exists to layer additional schema checks like §3.1 ID shape.
+
+    # 3. Strict scoping per RFC-001 (v0.2 forward-conformance check)
+    if not strict_scoping:
+        return errors
+
+    file_scope = (factbook.metadata or {}).get("scope")
+    # File-level scope is needed to disambiguate "is this an internal or external ref?"
+    if not file_scope:
+        errors.append(
+            "strict_scoping requires a top-level `scope:` field in the Factbook YAML "
+            "(per RFC-001). Add e.g. `scope: project:my-team`."
+        )
+        # Continue checking refs against bare-only namespace.
+        file_scope = None
+
+    def _check_ref(ref: str, where: str) -> None:
+        if _SCOPED_REF_RE.match(ref):
+            # Scoped form is always valid; we don't cross-repo-resolve in the SDK.
+            return
+        if _BARE_REF_RE.match(ref):
+            # Bare form: must resolve within this file.
+            if ref not in seen_ids:
+                errors.append(
+                    f"{where}: bare reference '{ref}' does not exist in this Factbook. "
+                    f"Either fix the id, or use the scoped form '<scope>:{ref}' for external refs (RFC-001)."
+                )
+            return
+        errors.append(
+            f"{where}: reference '{ref}' is neither a bare id nor a scoped <scope>:<id> form (RFC-001)."
+        )
+
+    for fact in factbook.content:
+        for sup in fact.supersedes:
+            _check_ref(sup, where=f"factlet '{fact.id}'.supersedes")
+        if fact.merged_into:
+            _check_ref(fact.merged_into, where=f"factlet '{fact.id}'.merged_into")
+
+    return errors
+
+
+# Capture file-level metadata fields the parser doesn't already extract.
+_orig_load = load_factbook
+def load_factbook(path: str) -> Factbook:  # type: ignore[no-redef]
+    """Parse a YAML/JSON Factbook from disk.
+
+    Same as the original loader but also captures file-level fields like
+    `scope:` into ``Factbook.metadata`` so callers (e.g. ``validate``) can
+    consult them. See SPEC.md §3.1 + RFC-001.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    fb = _orig_load(path)
+    if isinstance(raw, dict):
+        # Top-level fields useful for validation (scope, name, version, lifecycle).
+        for key in ("scope", "name", "version", "id", "pack_type", "lifecycle"):
+            if key in raw and key not in fb.metadata:
+                fb.metadata[key] = raw[key]
+    return fb
+
+
 __all__ = [
     "Factlet",
     "Factbook",
@@ -236,6 +333,7 @@ __all__ = [
     "render_for_claude",
     "render_for_gpt",
     "render_for_gemini",
+    "validate",
     "SPEC_VERSION",
     "__version__",
 ]
