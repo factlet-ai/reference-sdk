@@ -17,7 +17,7 @@ Python ships first to lock the contract via tests; TypeScript ports byte-identic
 cd python/
 pip install -e .
 python -c "from factlet import load_factbook, factsignal; \
-  fb = load_factbook('../../registry/examples/payments/factbook.yaml'); \
+  fb = load_factbook('../../registry/examples/payments/payments-factbook.yaml'); \
   print(factsignal('how do refunds work?', fb))"
 ```
 
