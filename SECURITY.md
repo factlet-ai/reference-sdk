@@ -7,7 +7,7 @@ If you discover a security vulnerability in the Factlet Protocol specification, 
 **Do not open a public issue.** Instead:
 
 - Use GitHub's private vulnerability reporting: open the **Security** tab on the affected repository → **Report a vulnerability**.
-- Or email **security@kernora.ai** with a description of the issue, reproduction steps, and your contact information.
+- Or email **hello@kernora.ai** with a description of the issue, reproduction steps, and your contact information.
 
 We will acknowledge your report within 3 business days and aim to provide a remediation timeline within 10 business days. Coordinated disclosure timelines are negotiable depending on severity and complexity.
 
