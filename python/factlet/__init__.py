@@ -44,7 +44,7 @@ import re
 import warnings
 import yaml  # PyYAML
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 SPEC_VERSION = "v1.0"  # base spec version; v0.2 additions are additive
 
 # ─── RFC 0002 — Profiles mechanism ────────────────────────────────────────
@@ -72,6 +72,46 @@ def is_profile_known(profile: str) -> bool:
     return profile in KNOWN_PROFILES
 
 
+def register_profile(name: str, schema: dict[str, Any]) -> None:
+    """Register a third-party profile schema. After this call,
+    `is_profile_known(name)` returns True and `validate_profile_fields`
+    applies the schema. Idempotent — re-registering with the same name
+    overwrites the previous schema."""
+    if not _PROFILE_NAME_RE.match(name):
+        raise ValueError(
+            f"profile name {name!r} must match {_PROFILE_NAME_RE.pattern} "
+            f"(lowercase letter prefix, lowercase alphanumerics + hyphens, max 64 chars)"
+        )
+    KNOWN_PROFILES[name] = schema
+
+
+def unregister_profile(name: str) -> None:
+    """Remove a previously-registered profile. Used in tests + by hosts
+    that need to swap profile schemas at runtime. No-op if absent."""
+    KNOWN_PROFILES.pop(name, None)
+
+
+# Path-traversal-safe identifier regexes used during parse.
+_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+# Dependency ids look like `team:web`, `best-practices:python-3.12-2026`, etc.
+# Disallow `/`, `..`, and other path-traversal characters explicitly.
+_DEPENDENCY_ID_RE = re.compile(r"^[a-zA-Z0-9_:.-]{1,256}$")
+
+
+def _is_safe_dependency_id(s: str) -> bool:
+    if not _DEPENDENCY_ID_RE.match(s):
+        return False
+    if ".." in s:  # explicit path-traversal block (regex permits single dots)
+        return False
+    return True
+
+# Base spec source_type enum (RFC 0003 §2). Profile extensions add to this
+# at runtime via register_profile() — they're recognized via warning
+# downgrade rather than rejection so producers can author against future
+# profiles before the SDK ships support.
+_BASE_SOURCE_TYPES = frozenset(["manual", "llm", "import", "forward-pass", "reverse-pass"])
+
+
 @dataclass
 class Origination:
     """Provenance of the factlet RECORD itself (RFC 0003).
@@ -83,13 +123,31 @@ class Origination:
     The `source_type` enum is profile-extensible per RFC 0003 §2.1 —
     registered Profiles MAY add domain-specific source_type values
     (e.g. a future Manufacturing Profile may add `opc-ua-server`,
-    `historian-extract`).
+    `historian-extract`). Unknown source_types emit a UserWarning rather
+    than raise so forward-compat producers can author against future
+    profiles before this SDK ships support.
+
+    `trust_prior` is range-checked at construction per RFC 0003 §1.
     """
     source_type: str  # manual | llm | import | forward-pass | reverse-pass | <profile-extension>
     source_ref: Optional[str] = None
     authored_at: Optional[str] = None
     authored_by: Optional[str] = None
     trust_prior: Optional[float] = None
+
+    def __post_init__(self):
+        if self.trust_prior is not None and not (0.0 <= self.trust_prior <= 1.0):
+            raise ValueError(
+                f"Origination.trust_prior must be in [0.0, 1.0]; got {self.trust_prior}"
+            )
+        if self.source_type not in _BASE_SOURCE_TYPES:
+            warnings.warn(
+                f"Origination.source_type {self.source_type!r} is not in the base RFC 0003 "
+                f"enum {sorted(_BASE_SOURCE_TYPES)}. If this is a registered Profile extension, "
+                f"ignore this warning.",
+                UserWarning,
+                stacklevel=3,
+            )
 
 
 @dataclass
@@ -121,12 +179,26 @@ class FactbookDependency:
         - "merged" (default): union of host + dependency factlets
         - "fallback": dependency consulted only when host returns nothing
         - "disabled": recorded for documentation; excluded from retrieval
+
+    `trust_prior` is range-checked at construction per RFC 0004 §1.
+    `id` shape is validated (no path traversal).
     """
     id: str
     version: Optional[str] = None
     source: Optional[str] = None
     trust_prior: Optional[float] = None
     retrieval_mode: str = "merged"
+
+    def __post_init__(self):
+        if self.trust_prior is not None and not (0.0 <= self.trust_prior <= 1.0):
+            raise ValueError(
+                f"FactbookDependency.trust_prior must be in [0.0, 1.0]; got {self.trust_prior}"
+            )
+        if not _is_safe_dependency_id(self.id):
+            raise ValueError(
+                f"FactbookDependency.id {self.id!r} must match {_DEPENDENCY_ID_RE.pattern} "
+                f"and contain no '..' (path traversal blocked)"
+            )
 
 
 @dataclass
@@ -213,15 +285,22 @@ def load_factbook(path: str) -> Factbook:
     # v0.2 — profile fields at root
     profile = raw.get("profile")
     profile_version = raw.get("profile_version")
-    if profile and not is_profile_known(str(profile)):
-        warnings.warn(
-            f"Factbook declares unknown profile '{profile}'. "
-            f"Per RFC 0002 §4, this SDK will preserve profile-specific fields on "
-            f"round-trip but cannot apply profile-specific validation. "
-            f"Known profiles: {sorted(KNOWN_PROFILES)}",
-            UserWarning,
-            stacklevel=2,
-        )
+    if profile is not None:
+        profile = str(profile)
+        if not _PROFILE_NAME_RE.match(profile):
+            raise ValueError(
+                f"Factbook profile {profile!r} must match {_PROFILE_NAME_RE.pattern} "
+                f"(no path-traversal characters)"
+            )
+        if not is_profile_known(profile):
+            warnings.warn(
+                f"Factbook declares unknown profile '{profile}'. "
+                f"Per RFC 0002 §4, this SDK will preserve profile-specific fields on "
+                f"round-trip but cannot apply profile-specific validation. "
+                f"Known profiles: {sorted(KNOWN_PROFILES)}",
+                UserWarning,
+                stacklevel=2,
+            )
 
     facts: list[Factlet] = []
     for i, item in enumerate(raw["content"] or []):
@@ -403,12 +482,12 @@ _SCOPED_REF_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-zA-Z0-9_-]+$")
 _BARE_REF_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
-def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
-    """Validate a parsed Factbook against the v0.1 spec.
+def validate(factbook: Factbook, *, strict_scoping: bool = False, profile_fields: bool = True) -> list[str]:
+    """Validate a parsed Factbook against the v0.1 + v0.2 specs.
 
     Returns a list of error messages. Empty list means valid.
 
-    Per RFC-001 (factlet-ai/spec rfcs/0001-scoped-fact-ids.md, targeting v0.2):
+    Per RFC-001 (factlet-ai/spec rfcs/0001-scoped-fact-ids.md, ratified v0.2):
     when ``strict_scoping=True``, references to other factlets in
     ``supersedes``, ``merged_into``, and reference-shaped fields MUST use the
     scoped form ``<scope>:<id>`` (e.g. ``factlet-ai:f001``) when pointing to
@@ -421,9 +500,14 @@ def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
     bare form are allowed; external references (different scope) MUST be
     scoped.
 
-    Conformance: this is a v0.1-permissive default (``strict_scoping=False``).
-    Setting the flag opts in to v0.2 RFC-001 conformance and MAY emit errors
-    that the v0.1 spec does not flag.
+    Per RFC 0002 + 0005 (v0.2): when ``profile_fields=True`` (default),
+    profile-specific schema validation also runs (delegates to
+    ``validate_profile_fields``). Set to False to skip if the caller wants
+    to defer profile validation.
+
+    Conformance: ``strict_scoping=False`` is v0.1-permissive default.
+    Setting it opts in to RFC-001 conformance and MAY emit errors that
+    the v0.1 spec does not flag.
     """
     errors: list[str] = []
 
@@ -439,6 +523,8 @@ def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
 
     # 3. Strict scoping per RFC-001 (v0.2 forward-conformance check)
     if not strict_scoping:
+        if profile_fields:
+            errors.extend(validate_profile_fields(factbook))
         return errors
 
     file_scope = (factbook.metadata or {}).get("scope")
@@ -472,6 +558,9 @@ def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
             _check_ref(sup, where=f"factlet '{fact.id}'.supersedes")
         if fact.merged_into:
             _check_ref(fact.merged_into, where=f"factlet '{fact.id}'.merged_into")
+
+    if profile_fields:
+        errors.extend(validate_profile_fields(factbook))
 
     return errors
 
@@ -517,10 +606,17 @@ class CycleDetected(Exception):
     """Raised by `detect_cycles` when the dependency graph contains a cycle."""
 
 
+class DependencyDepthExceeded(Exception):
+    """Raised by `detect_cycles` when transitive depth exceeds `max_depth`.
+    Distinct from `CycleDetected` — depth-exceeded indicates a runaway
+    acyclic resolver (e.g. always-returns-new-id), not a true cycle."""
+
+
 def detect_cycles(
     factbook_id: str,
     resolver: Callable[[str], Optional[Factbook]],
-    _visiting: Optional[set[str]] = None,
+    *,
+    max_depth: int = 64,
 ) -> None:
     """Detect cycles in a Factbook dependency graph (RFC 0004 §5).
 
@@ -529,22 +625,42 @@ def detect_cycles(
     descent). Implementations supply their own resolver (filesystem,
     registry HTTP, etc.) — the SDK does not mandate a specific one.
 
-    Raises `CycleDetected` if a cycle is found in the transitive graph.
+    `max_depth` (default 64) bounds transitive descent. RFC 0004 open
+    questions note typical depth is 1-2; 64 leaves headroom for unusual
+    composition while preventing recursion-limit crashes on malicious or
+    bug-loop resolvers.
+
+    Raises:
+        CycleDetected: if a cycle is found in the transitive graph.
+        DependencyDepthExceeded: if depth exceeds `max_depth`.
     """
-    if _visiting is None:
-        _visiting = set()
-    if factbook_id in _visiting:
+    _detect_cycles_inner(factbook_id, resolver, set(), 0, max_depth)
+
+
+def _detect_cycles_inner(
+    factbook_id: str,
+    resolver: Callable[[str], Optional[Factbook]],
+    visiting: set[str],
+    depth: int,
+    max_depth: int,
+) -> None:
+    if depth > max_depth:
+        raise DependencyDepthExceeded(
+            f"dependency depth exceeded {max_depth} resolving '{factbook_id}' "
+            f"(consider raising max_depth or checking for resolver runaway)"
+        )
+    if factbook_id in visiting:
         raise CycleDetected(
             f"dependency cycle detected: '{factbook_id}' transitively depends on itself"
         )
-    _visiting.add(factbook_id)
+    visiting.add(factbook_id)
     fb = resolver(factbook_id)
     if fb is not None:
         for dep in fb.dependencies:
             if dep.retrieval_mode == "disabled":
                 continue
-            detect_cycles(dep.id, resolver, _visiting)
-    _visiting.remove(factbook_id)
+            _detect_cycles_inner(dep.id, resolver, visiting, depth + 1, max_depth)
+    visiting.remove(factbook_id)
 
 
 # ─── RFC 0002 + 0005 — profile-specific schema validation ────────────────

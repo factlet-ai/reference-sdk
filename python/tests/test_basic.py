@@ -479,3 +479,143 @@ def test_rfc_0005_validate_no_profile_no_op():
     )
     errs = validate_profile_fields(fb)
     assert errs == []
+
+
+# ─── v0.2.1 validation-hardening tests ──────────────────────────────────
+
+
+def test_v021_origination_trust_prior_range_check():
+    """v0.2.1: Origination.trust_prior outside [0,1] raises ValueError."""
+    from factlet import Origination
+    Origination(source_type="manual", trust_prior=0.5)  # OK
+    Origination(source_type="manual", trust_prior=0.0)  # boundary OK
+    Origination(source_type="manual", trust_prior=1.0)  # boundary OK
+    Origination(source_type="manual", trust_prior=None)  # absent OK
+    try:
+        Origination(source_type="manual", trust_prior=1.5)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "trust_prior" in str(e)
+    try:
+        Origination(source_type="manual", trust_prior=-0.1)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "trust_prior" in str(e)
+
+
+def test_v021_origination_unknown_source_type_warns():
+    """v0.2.1: Origination.source_type outside base enum emits UserWarning."""
+    import warnings
+    from factlet import Origination
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Origination(source_type="not-a-real-type")
+    assert any("source_type" in str(w.message) for w in caught), [str(w.message) for w in caught]
+
+
+def test_v021_origination_base_source_types_no_warn():
+    """v0.2.1: All 5 base RFC 0003 source_types construct without warning."""
+    import warnings
+    from factlet import Origination
+    for st in ("manual", "llm", "import", "forward-pass", "reverse-pass"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            Origination(source_type=st)
+        assert not any("source_type" in str(w.message) for w in caught), \
+            f"unexpected warning for {st}"
+
+
+def test_v021_dependency_trust_prior_range_check():
+    """v0.2.1: FactbookDependency.trust_prior outside [0,1] raises ValueError."""
+    from factlet import FactbookDependency
+    FactbookDependency(id="ok", trust_prior=0.5)
+    try:
+        FactbookDependency(id="ok", trust_prior=99.0)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "trust_prior" in str(e)
+
+
+def test_v021_dependency_id_path_traversal_rejected():
+    """v0.2.1: FactbookDependency.id with path-traversal chars raises ValueError."""
+    from factlet import FactbookDependency
+    FactbookDependency(id="team:web")  # OK
+    FactbookDependency(id="best-practices:python-3.12-2026")  # OK
+    for bad in ("../etc/passwd", "team:web/../../escape", "id with spaces"):
+        try:
+            FactbookDependency(id=bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError as e:
+            assert "id" in str(e)
+
+
+def test_v021_profile_name_path_traversal_rejected(tmp_path):
+    """v0.2.1: load_factbook rejects path-traversal-shaped profile names."""
+    from factlet import load_factbook
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "profile: '../../../etc/passwd'\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n"
+    )
+    try:
+        load_factbook(str(fb_path))
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "profile" in str(e).lower() or "match" in str(e).lower()
+
+
+def test_v021_detect_cycles_max_depth():
+    """v0.2.1: detect_cycles raises DependencyDepthExceeded on runaway acyclic graph."""
+    from factlet import Factbook, FactbookDependency, detect_cycles, DependencyDepthExceeded
+
+    # Resolver always returns a NEW unique id — acyclic but unbounded
+    counter = {"i": 0}
+    def runaway_resolver(fb_id: str):
+        counter["i"] += 1
+        return Factbook(schema_version="v1.0", content=[],
+                        dependencies=[FactbookDependency(id=f"dep-{counter['i']}")])
+
+    try:
+        detect_cycles("root", runaway_resolver, max_depth=10)
+        assert False, "expected DependencyDepthExceeded"
+    except DependencyDepthExceeded as e:
+        assert "depth" in str(e).lower()
+
+
+def test_v021_register_profile_api():
+    """v0.2.1: register_profile + unregister_profile work; is_profile_known reflects."""
+    from factlet import register_profile, unregister_profile, is_profile_known
+    name = "test-domain-2026"
+    assert not is_profile_known(name)
+    register_profile(name, {"factlet_fields": {}})
+    try:
+        assert is_profile_known(name)
+    finally:
+        unregister_profile(name)
+    assert not is_profile_known(name)
+    # Bad name rejected
+    try:
+        register_profile("../etc/passwd", {})
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "match" in str(e).lower()
+
+
+def test_v021_validate_includes_profile_fields_by_default(tmp_path):
+    """v0.2.1: validate(fb) now includes profile_fields check by default."""
+    from factlet import load_factbook, validate
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "profile: software-engineering\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n    phase: bogus\n"
+    )
+    fb = load_factbook(str(fb_path))
+    errs = validate(fb)
+    assert any("phase" in e and "bogus" in e for e in errs), errs
+    # Opt out:
+    errs_off = validate(fb, profile_fields=False)
+    assert not any("phase" in e and "bogus" in e for e in errs_off)
