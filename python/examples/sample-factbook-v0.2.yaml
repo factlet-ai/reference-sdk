@@ -1,0 +1,85 @@
+schema_version: v1.0
+profile: software-engineering
+profile_version: "0.2"
+last_updated: 2026-05-08T00:00:00Z
+
+# RFC 0002: declaring `profile: software-engineering` opts in to the
+# Software Profile schema additions defined in RFC 0005 (the `phase` field).
+
+metadata:
+  name: payments-service
+  scope: project:payments
+
+# RFC 0004: composable factbooks via dependencies. The host factbook
+# composes against community best-practice factbooks. Modes:
+#   merged  — union with host facts (default)
+#   fallback — consulted only when host has no relevant facts
+#   disabled — recorded but excluded from retrieval
+dependencies:
+  factbooks:
+    - id: "best-practices:python-3.12-2026"
+      version: "v1.2"
+      source: "github.com/factlet-ai/registry/best-practices-python-3.12-2026"
+      trust_prior: 0.9
+      retrieval_mode: merged
+    - id: "security:owasp-top-10-2026"
+      retrieval_mode: merged
+
+content:
+  # phase: design — factlet relevant during architecture / design discussion
+  - id: f001
+    statement: "Refunds older than 90 days require manual ops approval, never auto-processed."
+    confidence: 1.0
+    sources:
+      - "docs/refund-policy.md:8"
+    phase: design
+    tags: [payments, ops, compliance]
+    # RFC 0003: origination block records WHO/WHAT produced the YAML record.
+    origination:
+      source_type: manual
+      authored_at: "2026-04-15T10:30:00Z"
+      authored_by: "human:alice@example.com"
+      trust_prior: 1.0
+
+  # phase: implementation — factlet relevant during code-writing
+  - id: f002
+    statement: "Database migrations run via Alembic; never raw SQL ALTER TABLE in application code."
+    confidence: 1.0
+    sources:
+      - "docs/db-conventions.md:14"
+    phase: implementation
+    tags: [database, conventions]
+
+  # LLM-proposed factlet, captured by a forward-pass writer during a Claude
+  # Code session. Trust prior < manual to reflect provisional status.
+  - id: f003
+    statement: "Slow-query metric exported when SQL execution exceeds 500ms; alarm fires at 1s."
+    confidence: 0.85
+    sources:
+      - "src/db/wrapper.py:184"
+      - "alerts.yaml:42"
+    phase: runtime
+    tags: [observability, alerts]
+    origination:
+      source_type: forward-pass
+      source_ref: "session:2026-05-08-claude-code-7f3a2b"
+      authored_at: "2026-05-08T14:22:00Z"
+      authored_by: "llm:claude-opus-4-7"
+      trust_prior: 0.7
+
+  # phase: testing — factlet relevant during test authoring or execution
+  - id: f004
+    statement: "Tests use the script-style harness, not pytest discovery."
+    confidence: 1.0
+    sources:
+      - "docs/testing-conventions.md:5"
+    phase: testing
+    tags: [testing, conventions]
+
+  # No phase field — phase-agnostic factlet (relevant across all phases).
+  # filter_by_phase() returns this factlet in every phase-scoped query.
+  - id: f005
+    statement: "Public registry hosts MIT-licensed example factbooks across multiple domains."
+    confidence: 1.0
+    sources:
+      - "github.com/factlet-ai/registry"

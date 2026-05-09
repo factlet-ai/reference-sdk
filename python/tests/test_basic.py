@@ -263,3 +263,219 @@ def test_validate_detects_duplicate_ids():
     )
     errs = validate(fb)
     assert any("duplicate id" in e and "f001" in e for e in errs), errs
+
+
+# ─── v0.2 RFC tests ──────────────────────────────────────────────────────
+
+
+def test_rfc_0002_known_profile():
+    """RFC 0002: SDK reports known profiles via is_profile_known()."""
+    from factlet import is_profile_known
+    assert is_profile_known("software-engineering") is True
+    assert is_profile_known("manufacturing") is False  # future profile, not yet registered
+
+
+def test_rfc_0002_unknown_profile_warns(tmp_path):
+    """RFC 0002 §4: loading a Factbook with unknown profile emits UserWarning."""
+    import warnings
+    from factlet import load_factbook
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "profile: unknown-future-profile\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n"
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fb = load_factbook(str(fb_path))
+    assert any(issubclass(w.category, UserWarning) and "unknown profile" in str(w.message)
+               for w in caught), [str(w.message) for w in caught]
+    # Round-trip preservation: profile field still set
+    assert fb.profile == "unknown-future-profile"
+
+
+def test_rfc_0003_origination_round_trip(tmp_path):
+    """RFC 0003: origination block parses + survives round-trip."""
+    from factlet import load_factbook
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "content:\n"
+        "  - id: f001\n"
+        "    statement: t\n"
+        "    confidence: 1.0\n"
+        "    sources: [x]\n"
+        "    origination:\n"
+        "      source_type: llm\n"
+        "      source_ref: 'session:abc'\n"
+        "      authored_at: '2026-05-08T00:00:00Z'\n"
+        "      authored_by: 'llm:claude-opus-4-7'\n"
+        "      trust_prior: 0.7\n"
+    )
+    fb = load_factbook(str(fb_path))
+    f = fb.content[0]
+    assert f.origination is not None
+    assert f.origination.source_type == "llm"
+    assert f.origination.source_ref == "session:abc"
+    assert f.origination.authored_by == "llm:claude-opus-4-7"
+    assert abs(f.origination.trust_prior - 0.7) < 1e-9
+
+
+def test_rfc_0003_filter_by_source_type():
+    """RFC 0003: filter_by_source_type returns only matching factlets."""
+    from factlet import Factlet, Origination, filter_by_source_type
+    facts = [
+        Factlet(id="f001", statement="a", confidence=1.0, sources=["x"],
+                origination=Origination(source_type="manual")),
+        Factlet(id="f002", statement="b", confidence=1.0, sources=["y"],
+                origination=Origination(source_type="llm")),
+        Factlet(id="f003", statement="c", confidence=1.0, sources=["z"]),  # no origination
+    ]
+    manual = filter_by_source_type(facts, "manual")
+    assert [f.id for f in manual] == ["f001"]
+    llm = filter_by_source_type(facts, "llm")
+    assert [f.id for f in llm] == ["f002"]
+    none_match = filter_by_source_type(facts, "import")
+    assert none_match == []
+
+
+def test_rfc_0004_dependencies_parse(tmp_path):
+    """RFC 0004: dependencies.factbooks parses with all sub-fields."""
+    from factlet import load_factbook
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "dependencies:\n"
+        "  factbooks:\n"
+        "    - id: 'best-practices:python-3.12-2026'\n"
+        "      version: 'v1.2'\n"
+        "      source: 'github.com/factlet-ai/registry/best-practices-python-3.12-2026'\n"
+        "      trust_prior: 0.9\n"
+        "      retrieval_mode: merged\n"
+        "    - id: 'security:owasp-top-10-2026'\n"
+        "      retrieval_mode: fallback\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n"
+    )
+    fb = load_factbook(str(fb_path))
+    assert len(fb.dependencies) == 2
+    d1 = fb.dependencies[0]
+    assert d1.id == "best-practices:python-3.12-2026"
+    assert d1.version == "v1.2"
+    assert d1.retrieval_mode == "merged"
+    assert abs(d1.trust_prior - 0.9) < 1e-9
+    d2 = fb.dependencies[1]
+    assert d2.retrieval_mode == "fallback"
+    assert d2.trust_prior is None
+
+
+def test_rfc_0004_retrieval_mode_invalid_falls_back_to_merged(tmp_path):
+    """RFC 0004: invalid retrieval_mode value defaults to merged."""
+    from factlet import load_factbook
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "dependencies:\n"
+        "  factbooks:\n"
+        "    - id: 'x:y'\n"
+        "      retrieval_mode: bogus\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n"
+    )
+    fb = load_factbook(str(fb_path))
+    assert fb.dependencies[0].retrieval_mode == "merged"
+
+
+def test_rfc_0004_cycle_detection():
+    """RFC 0004 §5: detect_cycles raises CycleDetected on circular graph."""
+    from factlet import Factbook, FactbookDependency, detect_cycles, CycleDetected
+
+    fb_a = Factbook(schema_version="v1.0", content=[],
+                    dependencies=[FactbookDependency(id="b")])
+    fb_b = Factbook(schema_version="v1.0", content=[],
+                    dependencies=[FactbookDependency(id="a")])
+
+    def resolver(fb_id: str):
+        return {"a": fb_a, "b": fb_b}.get(fb_id)
+
+    try:
+        detect_cycles("a", resolver)
+        assert False, "expected CycleDetected"
+    except CycleDetected as e:
+        assert "cycle" in str(e).lower()
+
+
+def test_rfc_0004_no_cycle_passes():
+    """RFC 0004 §5: detect_cycles returns silently on acyclic graph."""
+    from factlet import Factbook, FactbookDependency, detect_cycles
+
+    fb_a = Factbook(schema_version="v1.0", content=[],
+                    dependencies=[FactbookDependency(id="b")])
+    fb_b = Factbook(schema_version="v1.0", content=[],
+                    dependencies=[FactbookDependency(id="c")])
+    fb_c = Factbook(schema_version="v1.0", content=[])  # leaf
+
+    def resolver(fb_id: str):
+        return {"a": fb_a, "b": fb_b, "c": fb_c}.get(fb_id)
+
+    detect_cycles("a", resolver)  # should not raise
+
+
+def test_rfc_0005_phase_filter():
+    """RFC 0005: filter_by_phase returns matching + phase-agnostic factlets."""
+    from factlet import Factlet, filter_by_phase
+    facts = [
+        Factlet(id="f001", statement="a", confidence=1.0, sources=["x"], phase="design"),
+        Factlet(id="f002", statement="b", confidence=1.0, sources=["y"], phase="implementation"),
+        Factlet(id="f003", statement="c", confidence=1.0, sources=["z"]),  # phase-agnostic
+        Factlet(id="f004", statement="d", confidence=1.0, sources=["w"], phase="runtime"),
+    ]
+    impl = filter_by_phase(facts, "implementation")
+    # Should return f002 (matches) + f003 (phase-agnostic) per RFC 0005 §5
+    ids = [f.id for f in impl]
+    assert "f002" in ids
+    assert "f003" in ids
+    assert "f001" not in ids
+    assert "f004" not in ids
+
+
+def test_rfc_0005_phase_filter_invalid_raises():
+    """RFC 0005: filter_by_phase rejects values outside the enum."""
+    from factlet import filter_by_phase
+    try:
+        filter_by_phase([], "deployment")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "phase must be" in str(e)
+
+
+def test_rfc_0005_validate_profile_fields(tmp_path):
+    """RFC 0002 + 0005: validate_profile_fields rejects out-of-enum phase."""
+    from factlet import load_factbook, validate_profile_fields
+    fb_path = tmp_path / "fb.yaml"
+    fb_path.write_text(
+        "schema_version: v1.0\n"
+        "profile: software-engineering\n"
+        "content:\n"
+        "  - id: f001\n    statement: t\n    confidence: 1.0\n    sources: [x]\n    phase: design\n"
+        "  - id: f002\n    statement: t\n    confidence: 1.0\n    sources: [y]\n    phase: deployment\n"
+    )
+    fb = load_factbook(str(fb_path))
+    errs = validate_profile_fields(fb)
+    assert len(errs) == 1
+    assert "f002" in errs[0]
+    assert "phase" in errs[0]
+    assert "deployment" in errs[0]
+
+
+def test_rfc_0005_validate_no_profile_no_op():
+    """RFC 0002: profile-neutral Factbook → validate_profile_fields is a no-op."""
+    from factlet import Factbook, Factlet, validate_profile_fields
+    fb = Factbook(
+        schema_version="v1.0",
+        content=[Factlet(id="f001", statement="t", confidence=1.0, sources=["x"], phase="anything")],
+        # no profile declared
+    )
+    errs = validate_profile_fields(fb)
+    assert errs == []
