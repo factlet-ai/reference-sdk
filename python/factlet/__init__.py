@@ -1,8 +1,11 @@
 """Factlet Protocol reference SDK (Python).
 
-Implements the v0.1 spec at https://github.com/factlet-ai/spec/blob/main/SPEC.md.
+Implements the v0.1 spec at https://github.com/factlet-ai/spec/blob/main/SPEC.md
+and the v0.2 additions ratified by RFCs 0002 (Profiles mechanism), 0003
+(Origination provenance block), 0004 (Composable factbooks via dependencies),
+and 0005 (Software Profile — phase enum).
 
-Public API:
+Public API (v0.1 — unchanged):
 
     from factlet import load_factbook, retrieve, factsignal, on_low_factsignal
 
@@ -11,6 +14,26 @@ Public API:
     bars = factsignal("how do refunds work?", fb)
     on_low_factsignal(query, fb, threshold=2,
                      callback=lambda q, score, retrieved, t: print(f"Low: {score} bars"))
+
+Public API (v0.2 additions):
+
+    # RFC 0002 — Profiles mechanism
+    fb.profile                         # "software-engineering" or None
+    fb.profile_version                 # "0.2" or None
+    is_profile_known("software-engineering")  # True
+
+    # RFC 0003 — Origination provenance block
+    fact.origination                   # Origination(...) or None
+    filter_by_source_type(facts, "manual")
+    filter_by_source_type(facts, "llm")
+
+    # RFC 0004 — Dependencies
+    fb.dependencies                    # list[FactbookDependency]
+    detect_cycles(fb_chain)            # raises CycleDetected on cycles
+
+    # RFC 0005 — Software Profile (phase enum)
+    fact.phase                         # "design" / "implementation" / "testing" / "runtime" / None
+    filter_by_phase(facts, "implementation")
 """
 
 from __future__ import annotations
@@ -18,10 +41,55 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import re
+import warnings
 import yaml  # PyYAML
 
-__version__ = "0.1.0"
-SPEC_VERSION = "v1.0"
+__version__ = "0.2.0"
+SPEC_VERSION = "v1.0"  # base spec version; v0.2 additions are additive
+
+# ─── RFC 0002 — Profiles mechanism ────────────────────────────────────────
+# Registered profiles known to this SDK. Profiles add domain-specific
+# vocabulary on top of the base spec. Adding a profile here enables
+# profile-specific schema validation when a Factbook declares it.
+KNOWN_PROFILES: dict[str, dict[str, Any]] = {
+    "software-engineering": {
+        # RFC 0005 — phase enum on factlets within software-engineering profile
+        "factlet_fields": {
+            "phase": {"type": "enum", "values": ["design", "implementation", "testing", "runtime"]},
+        },
+    },
+    # Future: "manufacturing", "healthcare", "legal" via separate sub-RFCs.
+}
+
+
+def is_profile_known(profile: str) -> bool:
+    """Return True if this SDK has schema-extension support for the named profile.
+
+    Per RFC 0002 §4: an SDK that does not know a profile MUST still parse
+    Factbooks declaring it (round-trip preservation), but only profile-aware
+    SDKs apply richer validation.
+    """
+    return profile in KNOWN_PROFILES
+
+
+@dataclass
+class Origination:
+    """Provenance of the factlet RECORD itself (RFC 0003).
+
+    Distinct from `Factlet.sources` which provides provenance for the
+    underlying CLAIM. `Origination` records WHO/WHAT produced the YAML
+    record, WHEN, BY WHOM, and with what PRIOR TRUST level.
+
+    The `source_type` enum is profile-extensible per RFC 0003 §2.1 —
+    registered Profiles MAY add domain-specific source_type values
+    (e.g. a future Manufacturing Profile may add `opc-ua-server`,
+    `historian-extract`).
+    """
+    source_type: str  # manual | llm | import | forward-pass | reverse-pass | <profile-extension>
+    source_ref: Optional[str] = None
+    authored_at: Optional[str] = None
+    authored_by: Optional[str] = None
+    trust_prior: Optional[float] = None
 
 
 @dataclass
@@ -39,6 +107,26 @@ class Factlet:
     archived_reason: Optional[str] = None
     retired_at: Optional[str] = None
     extension: dict[str, Any] = field(default_factory=dict)
+    # v0.2 additions:
+    origination: Optional[Origination] = None  # RFC 0003
+    profile: Optional[str] = None              # RFC 0002 — per-factlet profile override
+    phase: Optional[str] = None                # RFC 0005 — software-engineering profile (design|implementation|testing|runtime)
+
+
+@dataclass
+class FactbookDependency:
+    """Declared dependency on another Factbook for composition (RFC 0004).
+
+    `retrieval_mode`:
+        - "merged" (default): union of host + dependency factlets
+        - "fallback": dependency consulted only when host returns nothing
+        - "disabled": recorded for documentation; excluded from retrieval
+    """
+    id: str
+    version: Optional[str] = None
+    source: Optional[str] = None
+    trust_prior: Optional[float] = None
+    retrieval_mode: str = "merged"
 
 
 @dataclass
@@ -48,6 +136,51 @@ class Factbook:
     content: list[Factlet]
     last_updated: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # v0.2 additions:
+    profile: Optional[str] = None                 # RFC 0002 — file-level profile
+    profile_version: Optional[str] = None         # RFC 0002 — profile schema version
+    dependencies: list[FactbookDependency] = field(default_factory=list)  # RFC 0004
+
+
+def _parse_origination(item: dict[str, Any]) -> Optional[Origination]:
+    """Parse the optional origination block per RFC 0003."""
+    block = item.get("origination")
+    if not block or not isinstance(block, dict):
+        return None
+    if "source_type" not in block:
+        return None  # source_type is required within the block; treat malformed as absent
+    return Origination(
+        source_type=str(block["source_type"]),
+        source_ref=block.get("source_ref"),
+        authored_at=block.get("authored_at"),
+        authored_by=block.get("authored_by"),
+        trust_prior=float(block["trust_prior"]) if block.get("trust_prior") is not None else None,
+    )
+
+
+def _parse_dependencies(raw: dict[str, Any]) -> list[FactbookDependency]:
+    """Parse the optional dependencies block per RFC 0004."""
+    deps_block = raw.get("dependencies")
+    if not deps_block or not isinstance(deps_block, dict):
+        return []
+    factbooks = deps_block.get("factbooks") or []
+    if not isinstance(factbooks, list):
+        return []
+    deps: list[FactbookDependency] = []
+    for entry in factbooks:
+        if not isinstance(entry, dict) or "id" not in entry:
+            continue
+        mode = entry.get("retrieval_mode", "merged")
+        if mode not in ("merged", "fallback", "disabled"):
+            mode = "merged"
+        deps.append(FactbookDependency(
+            id=str(entry["id"]),
+            version=entry.get("version"),
+            source=entry.get("source"),
+            trust_prior=float(entry["trust_prior"]) if entry.get("trust_prior") is not None else None,
+            retrieval_mode=mode,
+        ))
+    return deps
 
 
 def load_factbook(path: str) -> Factbook:
@@ -56,6 +189,19 @@ def load_factbook(path: str) -> Factbook:
     Validates required fields per SPEC.md §3.1. Raises ValueError on
     structural issues; does not enforce confidence range etc. (use the
     JSON Schema from factlet-ai/spec for full validation).
+
+    v0.2 additions (RFCs 0002, 0003, 0004, 0005):
+      - Parses optional `profile` and `profile_version` at Factbook root.
+      - Parses optional `dependencies.factbooks` list.
+      - Parses optional `origination` block on each factlet.
+      - Parses optional per-factlet `profile` override.
+      - Parses optional `phase` field on factlets (semantic only when
+        the Factbook declares `profile: software-engineering`).
+      - Captures other top-level fields like `scope`, `name`, `version`
+        into `metadata` for downstream use (e.g. validate()).
+      - Emits a UserWarning when an unknown profile is declared
+        (per RFC 0002 §4 conformance) — preserves the field on
+        round-trip without applying profile-specific validation.
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -63,6 +209,19 @@ def load_factbook(path: str) -> Factbook:
         raise ValueError(f"Factbook root must be a mapping, got {type(raw).__name__}")
     if "schema_version" not in raw or "content" not in raw:
         raise ValueError("Factbook MUST have schema_version and content (SPEC.md §5.1)")
+
+    # v0.2 — profile fields at root
+    profile = raw.get("profile")
+    profile_version = raw.get("profile_version")
+    if profile and not is_profile_known(str(profile)):
+        warnings.warn(
+            f"Factbook declares unknown profile '{profile}'. "
+            f"Per RFC 0002 §4, this SDK will preserve profile-specific fields on "
+            f"round-trip but cannot apply profile-specific validation. "
+            f"Known profiles: {sorted(KNOWN_PROFILES)}",
+            UserWarning,
+            stacklevel=2,
+        )
 
     facts: list[Factlet] = []
     for i, item in enumerate(raw["content"] or []):
@@ -87,13 +246,27 @@ def load_factbook(path: str) -> Factbook:
             archived_reason=item.get("archived_reason"),
             retired_at=item.get("retired_at"),
             extension=dict(item.get("extension") or {}),
+            origination=_parse_origination(item),
+            profile=item.get("profile"),
+            phase=item.get("phase"),
         ))
-    return Factbook(
+
+    fb = Factbook(
         schema_version=str(raw["schema_version"]),
         content=facts,
         last_updated=raw.get("last_updated"),
         metadata=dict(raw.get("metadata") or {}),
+        profile=profile,
+        profile_version=profile_version,
+        dependencies=_parse_dependencies(raw),
     )
+
+    # Capture file-level metadata fields for downstream validators.
+    for key in ("scope", "name", "version", "id", "pack_type", "lifecycle"):
+        if key in raw and key not in fb.metadata:
+            fb.metadata[key] = raw[key]
+
+    return fb
 
 
 def _tokenize(text: str) -> list[str]:
@@ -303,29 +476,119 @@ def validate(factbook: Factbook, *, strict_scoping: bool = False) -> list[str]:
     return errors
 
 
-# Capture file-level metadata fields the parser doesn't already extract.
-_orig_load = load_factbook
-def load_factbook(path: str) -> Factbook:  # type: ignore[no-redef]
-    """Parse a YAML/JSON Factbook from disk.
+# NOTE: file-level metadata capture (scope/name/version/etc.) and v0.2 field
+# parsing (profile/profile_version/dependencies/origination/phase) are now
+# integrated directly into load_factbook() above. The previous _orig_load
+# decorator pattern was removed for clarity.
 
-    Same as the original loader but also captures file-level fields like
-    `scope:` into ``Factbook.metadata`` so callers (e.g. ``validate``) can
-    consult them. See SPEC.md §3.1 + RFC-001.
+
+# ─── RFC 0003 + RFC 0005 — query helpers ──────────────────────────────────
+
+def filter_by_source_type(facts: Iterable[Factlet], source_type: str) -> list[Factlet]:
+    """Filter factlets by `origination.source_type` (RFC 0003 §2).
+
+    Returns factlets whose `origination` block has the given source_type.
+    Factlets with no origination block are excluded. Useful for audit
+    queries like "what fraction of cited facts were LLM-proposed?".
     """
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    fb = _orig_load(path)
-    if isinstance(raw, dict):
-        # Top-level fields useful for validation (scope, name, version, lifecycle).
-        for key in ("scope", "name", "version", "id", "pack_type", "lifecycle"):
-            if key in raw and key not in fb.metadata:
-                fb.metadata[key] = raw[key]
-    return fb
+    return [f for f in facts if f.origination and f.origination.source_type == source_type]
+
+
+def filter_by_phase(facts: Iterable[Factlet], phase: str) -> list[Factlet]:
+    """Filter factlets by `phase` (RFC 0005, software-engineering profile).
+
+    Returns factlets whose `phase` matches OR are phase-agnostic (phase is
+    None — relevant across phases per RFC 0005 §2). This matches the
+    recommended consumer behavior: when scoping retrieval to a phase,
+    include phase-agnostic factlets too.
+
+    `phase` MUST be one of: design, implementation, testing, runtime.
+    """
+    if phase not in ("design", "implementation", "testing", "runtime"):
+        raise ValueError(
+            f"phase must be one of design/implementation/testing/runtime; got '{phase}'"
+        )
+    return [f for f in facts if f.phase is None or f.phase == phase]
+
+
+# ─── RFC 0004 — dependency cycle detection ────────────────────────────────
+
+class CycleDetected(Exception):
+    """Raised by `detect_cycles` when the dependency graph contains a cycle."""
+
+
+def detect_cycles(
+    factbook_id: str,
+    resolver: Callable[[str], Optional[Factbook]],
+    _visiting: Optional[set[str]] = None,
+) -> None:
+    """Detect cycles in a Factbook dependency graph (RFC 0004 §5).
+
+    `resolver(id)` returns the resolved Factbook for a dependency id, or
+    None if it cannot be resolved (treated as a leaf — no further
+    descent). Implementations supply their own resolver (filesystem,
+    registry HTTP, etc.) — the SDK does not mandate a specific one.
+
+    Raises `CycleDetected` if a cycle is found in the transitive graph.
+    """
+    if _visiting is None:
+        _visiting = set()
+    if factbook_id in _visiting:
+        raise CycleDetected(
+            f"dependency cycle detected: '{factbook_id}' transitively depends on itself"
+        )
+    _visiting.add(factbook_id)
+    fb = resolver(factbook_id)
+    if fb is not None:
+        for dep in fb.dependencies:
+            if dep.retrieval_mode == "disabled":
+                continue
+            detect_cycles(dep.id, resolver, _visiting)
+    _visiting.remove(factbook_id)
+
+
+# ─── RFC 0002 + 0005 — profile-specific schema validation ────────────────
+
+def validate_profile_fields(factbook: Factbook) -> list[str]:
+    """Apply profile-specific schema validation per RFC 0002 §4.
+
+    For each factlet in a Factbook declaring a known profile, verify
+    profile-specific fields. Returns a list of error strings (empty on
+    success). Factbooks declaring unknown profiles return [] — preservation
+    happens at parse time; validation is no-op for unknown profiles.
+
+    For software-engineering profile (RFC 0005): validates `phase` is one
+    of {design, implementation, testing, runtime} when present.
+    """
+    errors: list[str] = []
+    if not factbook.profile or not is_profile_known(factbook.profile):
+        return errors
+
+    profile_spec = KNOWN_PROFILES[factbook.profile]
+    factlet_field_specs = profile_spec.get("factlet_fields", {})
+
+    for fact in factbook.content:
+        # Per-factlet profile override: only validate against named profile
+        # if the factlet's profile matches the file profile (or is unset).
+        if fact.profile and fact.profile != factbook.profile:
+            continue
+        for field_name, spec in factlet_field_specs.items():
+            value = getattr(fact, field_name, None)
+            if value is None:
+                continue  # field is optional
+            if spec["type"] == "enum" and value not in spec["values"]:
+                errors.append(
+                    f"factlet '{fact.id}': field '{field_name}' value '{value}' is not in "
+                    f"profile '{factbook.profile}' enum {spec['values']}"
+                )
+    return errors
 
 
 __all__ = [
     "Factlet",
     "Factbook",
+    "Origination",
+    "FactbookDependency",
     "load_factbook",
     "retrieve",
     "factsignal",
@@ -334,6 +597,13 @@ __all__ = [
     "render_for_gpt",
     "render_for_gemini",
     "validate",
+    "validate_profile_fields",
+    "filter_by_source_type",
+    "filter_by_phase",
+    "detect_cycles",
+    "CycleDetected",
+    "is_profile_known",
+    "KNOWN_PROFILES",
     "SPEC_VERSION",
     "__version__",
 ]
