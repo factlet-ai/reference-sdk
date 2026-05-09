@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "factlet"
-version = "0.2.0"
-description = "Reference Python implementation of the Factlet Protocol (v0.1 base + v0.2 RFCs 0002/0003/0004/0005)"
+version = "0.2.1"
+description = "Reference Python implementation of the Factlet Protocol (v0.1 base + v0.2 RFCs 0002/0003/0004/0005). v0.2.1: validation hardening — range checks, identifier validators, max-depth, register_profile API"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
